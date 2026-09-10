@@ -1,0 +1,132 @@
+// Outbound AI voice call agent
+// Requires env vars: TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET,
+//                    TWILIO_NUMBER, ANTHROPIC_API_KEY, PUBLIC_BASE_URL
+//
+// PUBLIC_BASE_URL = the live URL Twilio can reach (e.g. https://your-app.onrender.com)
+
+const express = require('express');
+const twilio = require('twilio');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+const client = twilio(
+  process.env.TWILIO_API_KEY_SID,
+  process.env.TWILIO_API_KEY_SECRET,
+  { accountSid: process.env.TWILIO_ACCOUNT_SID }
+);
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ---- CALL SCRIPT / BRIEF ----
+// This is the only part you should need to edit day-to-day.
+const CALL_BRIEF = `
+You are a warm, natural-sounding voice agent making a phone call on behalf of Ruben.
+Keep responses SHORT (1-2 sentences) since this is a live phone call, not a chat.
+Be conversational, not robotic. If the person wants to end the call, say a warm goodbye
+and include the exact token [END_CALL] at the end of your response.
+Purpose of this call: {{PURPOSE}}
+`;
+
+// In-memory conversation store, keyed by Twilio Call SID.
+// Fine for a 2-person test; swap for a real DB before scaling.
+const conversations = {};
+
+// ---- 1. TRIGGER AN OUTBOUND CALL ----
+// POST { "to": "+12345550123", "purpose": "check in and ask about her day" }
+app.post('/call/start', async (req, res) => {
+  const { to, purpose } = req.body;
+  if (!to) return res.status(400).json({ error: 'Missing "to" number' });
+
+  try {
+    const call = await client.calls.create({
+      to,
+      from: process.env.TWILIO_NUMBER,
+      url: `${process.env.PUBLIC_BASE_URL}/voice/answer?purpose=${encodeURIComponent(purpose || 'a friendly check-in')}`,
+    });
+    res.json({ status: 'calling', sid: call.sid });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- 2. CALL ANSWERED: greet + start listening ----
+app.post('/voice/answer', (req, res) => {
+  const purpose = req.query.purpose || 'a friendly check-in';
+  const callSid = req.body.CallSid;
+
+  conversations[callSid] = [
+    { role: 'user', content: `[System: call just connected. Purpose: ${purpose}. Greet them naturally and start the conversation.]` }
+  ];
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  const gather = twiml.gather({
+    input: 'speech',
+    action: `/voice/respond?purpose=${encodeURIComponent(purpose)}`,
+    speechTimeout: 'auto',
+  });
+  gather.say({ voice: 'Polly.Joanna' }, "Hi! One moment.");
+  twiml.redirect(`/voice/respond?purpose=${encodeURIComponent(purpose)}&first=true`);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ---- 3. CORE CONVERSATION LOOP ----
+app.post('/voice/respond', async (req, res) => {
+  const callSid = req.body.CallSid;
+  const purpose = req.query.purpose || 'a friendly check-in';
+  const speechResult = req.body.SpeechResult;
+  const isFirst = req.query.first === 'true';
+
+  if (!conversations[callSid]) conversations[callSid] = [];
+  if (speechResult) {
+    conversations[callSid].push({ role: 'user', content: speechResult });
+  }
+
+  const systemPrompt = CALL_BRIEF.replace('{{PURPOSE}}', purpose);
+
+  const messages = isFirst
+    ? [{ role: 'user', content: '[Greet them and start the conversation now.]' }]
+    : conversations[callSid];
+
+  const aiResponse = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
+    system: systemPrompt,
+    messages,
+  });
+
+  const replyText = aiResponse.content.find(b => b.type === 'text')?.text || "Sorry, could you repeat that?";
+  const shouldEnd = replyText.includes('[END_CALL]');
+  const cleanReply = replyText.replace('[END_CALL]', '').trim();
+
+  conversations[callSid].push({ role: 'assistant', content: cleanReply });
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'Polly.Joanna' }, cleanReply);
+
+  if (shouldEnd) {
+    twiml.hangup();
+    delete conversations[callSid];
+  } else {
+    const gather = twiml.gather({
+      input: 'speech',
+      action: `/voice/respond?purpose=${encodeURIComponent(purpose)}`,
+      speechTimeout: 'auto',
+    });
+    twiml.redirect(`/voice/respond?purpose=${encodeURIComponent(purpose)}`);
+  }
+
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ---- 4. CALL STATUS LOGGING (optional) ----
+app.post('/voice/status', (req, res) => {
+  console.log(`Call ${req.body.CallSid} status: ${req.body.CallStatus}`);
+  res.sendStatus(200);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Voice agent listening on port ${PORT}`));
